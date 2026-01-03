@@ -1,0 +1,171 @@
+#include <ESP32Servo.h>
+#include <NimBLEDevice.h>
+
+// Servo pins
+const int ROLL_PIN = 6;
+const int PITCH_PIN = 7;
+
+Servo rollServo;
+Servo pitchServo;
+
+int rollCenter = 90;
+int pitchCenter = 90;
+
+// BLE NUS UUIDs
+static NimBLEUUID NUS_SERVICE("6E400001-B5A3-F393-E0A9-E50E24DCCA9E");
+static NimBLEUUID NUS_RX_CHAR("6E400002-B5A3-F393-E0A9-E50E24DCCA9E"); // phone writes
+static NimBLEUUID NUS_TX_CHAR("6E400003-B5A3-F393-E0A9-E50E24DCCA9E"); // notify to phone
+
+NimBLECharacteristic* txChar = nullptr;
+volatile bool deviceConnected = false;
+
+static void sendLine(const char* s) {
+  if (deviceConnected && txChar) {
+    txChar->setValue((uint8_t*)s, strlen(s));
+    txChar->notify();
+  }
+}
+
+static void sendResp(const char* msg) {
+  char buf[180];
+  snprintf(buf, sizeof(buf), "RESP %s\n", msg);
+  sendLine(buf);
+}
+
+static void apply() {
+  rollCenter = constrain(rollCenter, 0, 180);
+  pitchCenter = constrain(pitchCenter, 0, 180);
+  rollServo.write(rollCenter);
+  pitchServo.write(pitchCenter);
+}
+
+static void reportCenters() {
+  char buf[180];
+  snprintf(buf, sizeof(buf), "RESP rollCenter=%d pitchCenter=%d\n", rollCenter, pitchCenter);
+  sendLine(buf);
+}
+
+class ServerCallbacks : public NimBLEServerCallbacks {
+public:
+  // Newer signature
+  void onConnect(NimBLEServer* s, NimBLEConnInfo& ci) {
+    (void)s; (void)ci;
+    deviceConnected = true;
+    sendResp("OK CONNECTED");
+    sendResp("Commands: R+/R-/R++/R--  P+/P-/P++/P--  S  90");
+    reportCenters();
+  }
+  void onDisconnect(NimBLEServer* s, NimBLEConnInfo& ci, int reason) {
+    (void)s; (void)ci; (void)reason;
+    deviceConnected = false;
+    NimBLEDevice::startAdvertising(); // keep it discoverable
+  }
+
+  // Older signature compatibility
+  void onConnect(NimBLEServer* s) {
+    (void)s;
+    deviceConnected = true;
+    sendResp("OK CONNECTED");
+    sendResp("Commands: R+/R-/R++/R--  P+/P-/P++/P--  S  90");
+    reportCenters();
+  }
+  void onDisconnect(NimBLEServer* s) {
+    (void)s;
+    deviceConnected = false;
+    NimBLEDevice::startAdvertising();
+  }
+};
+
+class RxCallbacks : public NimBLECharacteristicCallbacks {
+public:
+  void onWrite(NimBLECharacteristic* c, NimBLEConnInfo& ci) { (void)ci; handleRx(c); }
+  void onWrite(NimBLECharacteristic* c) { handleRx(c); }
+
+private:
+  void handleRx(NimBLECharacteristic* c) {
+    std::string v = c->getValue();
+    if (v.empty()) return;
+    if (v.size() > 16) { sendResp("ERR cmd too long"); return; }
+
+    // allow only printable ASCII
+    for (char ch : v) {
+      if (ch < 0x20 || ch > 0x7E) { sendResp("ERR bad chars"); return; }
+    }
+
+    while (!v.empty() && (v.back() == '\r' || v.back() == '\n')) v.pop_back();
+
+    // Uppercase
+    for (auto& ch : v) ch = (char)toupper(ch);
+
+    if (v == "S") {
+      reportCenters();
+      return;
+    }
+    if (v == "90") {
+      rollCenter = 90;
+      pitchCenter = 90;
+      apply();
+      reportCenters();
+      return;
+    }
+
+    if (v == "R+") rollCenter += 1;
+    else if (v == "R-") rollCenter -= 1;
+    else if (v == "R++") rollCenter += 5;
+    else if (v == "R--") rollCenter -= 5;
+    else if (v == "P+") pitchCenter += 1;
+    else if (v == "P-") pitchCenter -= 1;
+    else if (v == "P++") pitchCenter += 5;
+    else if (v == "P--") pitchCenter -= 5;
+    else {
+      sendResp("ERR unknown cmd");
+      return;
+    }
+
+    apply();
+    reportCenters();
+  }
+};
+
+void setup() {
+  // Servos
+  rollServo.setPeriodHertz(50);
+  pitchServo.setPeriodHertz(50);
+  rollServo.attach(ROLL_PIN, 500, 2400);
+  pitchServo.attach(PITCH_PIN, 500, 2400);
+  apply();
+
+  // BLE
+  NimBLEDevice::init("NANO-ESP32-CAL");
+
+  NimBLEServer* server = NimBLEDevice::createServer();
+  server->setCallbacks(new ServerCallbacks());
+
+  NimBLEService* svc = server->createService(NUS_SERVICE);
+
+  txChar = svc->createCharacteristic(NUS_TX_CHAR, NIMBLE_PROPERTY::NOTIFY);
+
+  NimBLECharacteristic* rxChar = svc->createCharacteristic(
+    NUS_RX_CHAR,
+    NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_NR
+  );
+  rxChar->setCallbacks(new RxCallbacks());
+
+  svc->start();
+
+  NimBLEAdvertising* adv = NimBLEDevice::getAdvertising();
+  adv->addServiceUUID(NUS_SERVICE);
+
+  // Add small manufacturer tag to make it easier to spot
+  std::string mfg;
+  mfg += char(0xFF);
+  mfg += char(0xFF);
+  mfg += "CAL";
+  adv->setManufacturerData(mfg);
+
+  adv->start();
+}
+
+void loop() {
+  delay(100);
+}
