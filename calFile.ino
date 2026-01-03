@@ -4,52 +4,47 @@
 #include <ESP32Servo.h>
 #include <NimBLEDevice.h>
 
-// ================== USER SETTINGS ==================
+// ================== YOUR HARDWARE ==================
+const int SERVO_ROLL_PIN  = 6;   // roll servo signal pin
+const int SERVO_PITCH_PIN = 7;   // pitch servo signal pin
 
-// Your servo pins (as requested)
-const int SERVO_ROLL_PIN  = 6;  // Roll servo signal
-const int SERVO_PITCH_PIN = 7;  // Pitch servo signal
-
-// I2C pins for Nano ESP32 headers (your working scan found 0x68 on these)
+// Nano ESP32 I2C mapping (works for you)
 const int I2C_SDA_PIN = A4;
 const int I2C_SCL_PIN = A5;
 
-// Servo safety limits (degrees)
-int SERVO_ROLL_MIN  = 20;
-int SERVO_ROLL_MAX  = 160;
-int SERVO_PITCH_MIN = 20;
-int SERVO_PITCH_MAX = 160;
+// ================== SERVO LIMITS (+/- 15 ONLY) ==================
+const int SERVO_CENTER = 90;
+const int SERVO_DELTA_MAX = 15;            // +/- 15 degrees
+const int SERVO_ROLL_MIN  = SERVO_CENTER - SERVO_DELTA_MAX;   // 75
+const int SERVO_ROLL_MAX  = SERVO_CENTER + SERVO_DELTA_MAX;   // 105
+const int SERVO_PITCH_MIN = SERVO_CENTER - SERVO_DELTA_MAX;   // 75
+const int SERVO_PITCH_MAX = SERVO_CENTER + SERVO_DELTA_MAX;   // 105
 
-// Tilt mapping
-float MAX_TILT_DEG = 30.0f;     // clamp IMU tilt used for control
-float SERVO_GAIN   = 2.0f;      // deg servo per deg tilt (2.0 => 30deg tilt -> 60deg servo change)
+// Map tilt to servo travel
+float MAX_TILT_DEG = 30.0f;   // tilt range that maps to full +/-15 servo travel
 
-// Invert directions if servo moves opposite of expected
+// Flip if directions are backwards
 bool INVERT_ROLL  = false;
 bool INVERT_PITCH = false;
 
-// Smoothing (0..1). Higher = more responsive, lower = smoother.
+// Smoothing (0..1): lower = smoother, higher = more responsive
 float SMOOTH_ALPHA = 0.15f;
 
-// Require calibration before arming
-bool REQUIRE_CAL_BEFORE_ARM = true;
-
-// Arm PIN (simple safety gate)
+// Safer arming
 const char* ARM_PIN = "1234";
+bool REQUIRE_CAL_BEFORE_ARM = false; // no CAL required; we will NOT use CAL in this version
 
-// Control loop rate (servo update)
-uint32_t controlIntervalMs = 20;   // 50 Hz control
+// Optional telemetry (OFF by default so responses are easy to read)
+bool telemetryOn = false;
+uint32_t telemetryIntervalMs = 250;
+uint32_t controlIntervalMs = 20; // 50Hz servo update
 
-// Telemetry rate (BLE noisy stream)
-uint32_t telemetryIntervalMs = 200; // slower by default
-
-// ====================================================
-
-// BLE NUS UUIDs (Nordic UART Service)
+// ================== BLE NUS UUIDs ==================
 static NimBLEUUID NUS_SERVICE("6E400001-B5A3-F393-E0A9-E50E24DCCA9E");
-static NimBLEUUID NUS_RX_CHAR("6E400002-B5A3-F393-E0A9-E50E24DCCA9E"); // phone writes here
-static NimBLEUUID NUS_TX_CHAR("6E400003-B5A3-F393-E0A9-E50E24DCCA9E"); // notify to phone
+static NimBLEUUID NUS_RX_CHAR("6E400002-B5A3-F393-E0A9-E50E24DCCA9E");
+static NimBLEUUID NUS_TX_CHAR("6E400003-B5A3-F393-E0A9-E50E24DCCA9E");
 
+// ================== GLOBALS ==================
 Adafruit_MPU6050 mpu;
 Servo servoRoll, servoPitch;
 
@@ -57,23 +52,20 @@ NimBLECharacteristic* txChar = nullptr;
 volatile bool deviceConnected = false;
 
 bool imuOk = false;
-
 bool armed = false;
+
+// We keep offsets but do not expose CAL here; you can enable auto-zero later
 bool calibrated = false;
 float pitchOffsetDeg = 0.0f;
 float rollOffsetDeg  = 0.0f;
 
-// Telemetry/Debug stream (OFF by default to keep command responses readable)
-bool telemetryOn = false;
-
-// Smoothed servo outputs
-float rollServoSmoothed  = 90.0f;
-float pitchServoSmoothed = 90.0f;
-
-// Latest computed state (used for STATUS / telemetry)
 float pitchDeg = 0.0f, rollDeg = 0.0f;
 int rollServoCmd = 90, pitchServoCmd = 90;
 
+float rollServoSmoothed  = 90.0f;
+float pitchServoSmoothed = 90.0f;
+
+// ================== HELPERS ==================
 static int clampi(int v, int lo, int hi) {
   if (v < lo) return lo;
   if (v > hi) return hi;
@@ -93,34 +85,19 @@ static void sendLine(const char* s) {
 }
 
 static void sendResp(const char* msg) {
-  char buf[160];
+  char buf[200];
   snprintf(buf, sizeof(buf), "RESP %s\n", msg);
-  sendLine(buf);
-}
-
-static void sendStatusLine() {
-  char buf[220];
-  snprintf(buf, sizeof(buf),
-           "RESP STATUS t=%lu imu=%d cal=%d armed=%d pitch=%.1f roll=%.1f sRoll=%d sPitch=%d\n",
-           (unsigned long)millis(),
-           imuOk ? 1 : 0,
-           calibrated ? 1 : 0,
-           armed ? 1 : 0,
-           pitchDeg, rollDeg,
-           rollServoCmd, pitchServoCmd);
   sendLine(buf);
 }
 
 static void setArmed(bool on) {
   armed = on;
   if (!armed) {
-    // Safe: center servos
-    servoRoll.write(90);
-    servoPitch.write(90);
+    servoRoll.write(SERVO_CENTER);
+    servoPitch.write(SERVO_CENTER);
   }
 }
 
-// Compute accel-only pitch/roll (good for hand testing)
 static void computePitchRollDeg(const sensors_event_t& a, float& pitchOut, float& rollOut) {
   float ax = a.acceleration.x;
   float ay = a.acceleration.y;
@@ -133,63 +110,43 @@ static void computePitchRollDeg(const sensors_event_t& a, float& pitchOut, float
   rollOut  = roll;
 }
 
-static void doCalibration() {
-  if (!imuOk) {
-    sendResp("ERR IMU not OK");
-    return;
-  }
-
-  sendResp("CAL START (hold level + still)");
-
-  const int N = 200;
-  float pitchSum = 0.0f;
-  float rollSum  = 0.0f;
-
-  for (int i = 0; i < N; i++) {
-    sensors_event_t a, g, t;
-    mpu.getEvent(&a, &g, &t);
-
-    float p, r;
-    computePitchRollDeg(a, p, r);
-    pitchSum += p;
-    rollSum  += r;
-
-    delay(5);
-  }
-
-  pitchOffsetDeg = pitchSum / (float)N;
-  rollOffsetDeg  = rollSum  / (float)N;
-  calibrated = true;
-
-  char msg[120];
-  snprintf(msg, sizeof(msg), "OK CAL pitchOffset=%.2f rollOffset=%.2f", pitchOffsetDeg, rollOffsetDeg);
-  sendResp(msg);
+static void sendStatus() {
+  char buf[240];
+  snprintf(buf, sizeof(buf),
+           "RESP STATUS t=%lu imu=%d armed=%d pitch=%.1f roll=%.1f sRoll=%d sPitch=%d limits=[%d..%d]\n",
+           (unsigned long)millis(),
+           imuOk ? 1 : 0,
+           armed ? 1 : 0,
+           pitchDeg, rollDeg,
+           rollServoCmd, pitchServoCmd,
+           SERVO_ROLL_MIN, SERVO_ROLL_MAX);
+  sendLine(buf);
 }
 
-// ---------- BLE callbacks ----------
+// ================== BLE CALLBACKS ==================
 class ServerCallbacks : public NimBLEServerCallbacks {
 public:
-  void onConnect(NimBLEServer* pServer, NimBLEConnInfo& connInfo) {
-    (void)pServer; (void)connInfo;
+  void onConnect(NimBLEServer* s, NimBLEConnInfo& ci) {
+    (void)s; (void)ci;
     deviceConnected = true;
     sendResp("OK CONNECTED");
-    sendResp("Commands: CAL | ARM 1234 | DISARM | STATUS | DEBUG ON/OFF | LIMITS rMin rMax pMin pMax");
+    sendResp("Commands: ARM 1234 | DISARM | STATUS | DEBUG ON | DEBUG OFF");
   }
-  void onDisconnect(NimBLEServer* pServer, NimBLEConnInfo& connInfo, int reason) {
-    (void)pServer; (void)connInfo; (void)reason;
+  void onDisconnect(NimBLEServer* s, NimBLEConnInfo& ci, int reason) {
+    (void)s; (void)ci; (void)reason;
     deviceConnected = false;
     setArmed(false); // auto-disarm for safety
   }
 
   // Older signature compatibility
-  void onConnect(NimBLEServer* pServer) {
-    (void)pServer;
+  void onConnect(NimBLEServer* s) {
+    (void)s;
     deviceConnected = true;
     sendResp("OK CONNECTED");
-    sendResp("Commands: CAL | ARM 1234 | DISARM | STATUS | DEBUG ON/OFF | LIMITS rMin rMax pMin pMax");
+    sendResp("Commands: ARM 1234 | DISARM | STATUS | DEBUG ON | DEBUG OFF");
   }
-  void onDisconnect(NimBLEServer* pServer) {
-    (void)pServer;
+  void onDisconnect(NimBLEServer* s) {
+    (void)s;
     deviceConnected = false;
     setArmed(false);
   }
@@ -197,7 +154,7 @@ public:
 
 class RxCallbacks : public NimBLECharacteristicCallbacks {
 public:
-  void onWrite(NimBLECharacteristic* c, NimBLEConnInfo& connInfo) { (void)connInfo; handleRx(c); }
+  void onWrite(NimBLECharacteristic* c, NimBLEConnInfo& ci) { (void)ci; handleRx(c); }
   void onWrite(NimBLECharacteristic* c) { handleRx(c); }
 
 private:
@@ -211,15 +168,7 @@ private:
     }
     while (!v.empty() && (v.back() == '\r' || v.back() == '\n')) v.pop_back();
 
-    if (v == "CAL") {
-      doCalibration();
-      return;
-    }
-
-    if (v == "STATUS") {
-      sendStatusLine();
-      return;
-    }
+    if (v == "STATUS") { sendStatus(); return; }
 
     if (v == "DISARM") {
       setArmed(false);
@@ -235,49 +184,25 @@ private:
     if (v.rfind("ARM ", 0) == 0) {
       std::string pin = v.substr(4);
       if (pin != ARM_PIN) { sendResp("ERR BAD PIN"); return; }
-      if (REQUIRE_CAL_BEFORE_ARM && !calibrated) { sendResp("ERR NOT CALIBRATED (send CAL first)"); return; }
+      if (REQUIRE_CAL_BEFORE_ARM && !calibrated) { sendResp("ERR NOT CALIBRATED"); return; }
       setArmed(true);
       sendResp("OK ARMED");
       return;
     }
 
-    if (v == "DEBUG ON") {
-      telemetryOn = true;
-      sendResp("OK DEBUG ON");
-      return;
-    }
-    if (v == "DEBUG OFF") {
-      telemetryOn = false;
-      sendResp("OK DEBUG OFF");
-      return;
-    }
-
-    if (v.rfind("LIMITS ", 0) == 0) {
-      int rMin, rMax, pMin, pMax;
-      if (sscanf(v.c_str(), "LIMITS %d %d %d %d", &rMin, &rMax, &pMin, &pMax) != 4) {
-        sendResp("ERR LIMITS format");
-        return;
-      }
-      if (rMin < 0 || rMax > 180 || pMin < 0 || pMax > 180 || rMin >= rMax || pMin >= pMax) {
-        sendResp("ERR LIMITS range");
-        return;
-      }
-      SERVO_ROLL_MIN = rMin; SERVO_ROLL_MAX = rMax;
-      SERVO_PITCH_MIN = pMin; SERVO_PITCH_MAX = pMax;
-      sendResp("OK LIMITS");
-      return;
-    }
+    if (v == "DEBUG ON")  { telemetryOn = true;  sendResp("OK DEBUG ON");  return; }
+    if (v == "DEBUG OFF") { telemetryOn = false; sendResp("OK DEBUG OFF"); return; }
 
     sendResp("ERR unknown cmd");
   }
 };
 
+// ================== SETUP/LOOP ==================
 void setup() {
-  // I2C
+  // I2C + IMU
   Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
   Wire.setClock(100000);
 
-  // IMU
   imuOk = mpu.begin();
   if (imuOk) {
     mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
@@ -290,8 +215,8 @@ void setup() {
   servoPitch.setPeriodHertz(50);
   servoRoll.attach(SERVO_ROLL_PIN, 500, 2400);
   servoPitch.attach(SERVO_PITCH_PIN, 500, 2400);
-  servoRoll.write(90);
-  servoPitch.write(90);
+  servoRoll.write(SERVO_CENTER);
+  servoPitch.write(SERVO_CENTER);
 
   // BLE
   NimBLEDevice::init("NanoESP32-BLE-UART");
@@ -299,7 +224,6 @@ void setup() {
   server->setCallbacks(new ServerCallbacks());
 
   NimBLEService* svc = server->createService(NUS_SERVICE);
-
   txChar = svc->createCharacteristic(NUS_TX_CHAR, NIMBLE_PROPERTY::NOTIFY);
 
   NimBLECharacteristic* rxChar = svc->createCharacteristic(
@@ -318,10 +242,9 @@ void setup() {
 void loop() {
   static uint32_t lastControl = 0;
   static uint32_t lastTelem = 0;
-
   uint32_t now = millis();
 
-  // ---------- Control update ----------
+  // ---- Control loop ----
   if (now - lastControl >= controlIntervalMs) {
     lastControl = now;
 
@@ -341,12 +264,15 @@ void loop() {
       if (INVERT_PITCH) p = -p;
       if (INVERT_ROLL)  r = -r;
 
-      float rollTarget  = 90.0f + (r * SERVO_GAIN);
-      float pitchTarget = 90.0f + (p * SERVO_GAIN);
+      // Map tilt to +/-15 degrees
+      float pitchTarget = (float)SERVO_CENTER + (p / MAX_TILT_DEG) * (float)SERVO_DELTA_MAX;
+      float rollTarget  = (float)SERVO_CENTER + (r / MAX_TILT_DEG) * (float)SERVO_DELTA_MAX;
 
-      rollTarget  = clampf(rollTarget,  (float)SERVO_ROLL_MIN,  (float)SERVO_ROLL_MAX);
+      // Clamp to +/-15 range
       pitchTarget = clampf(pitchTarget, (float)SERVO_PITCH_MIN, (float)SERVO_PITCH_MAX);
+      rollTarget  = clampf(rollTarget,  (float)SERVO_ROLL_MIN,  (float)SERVO_ROLL_MAX);
 
+      // Smooth
       rollServoSmoothed  = rollServoSmoothed  + SMOOTH_ALPHA * (rollTarget  - rollServoSmoothed);
       pitchServoSmoothed = pitchServoSmoothed + SMOOTH_ALPHA * (pitchTarget - pitchServoSmoothed);
 
@@ -359,19 +285,18 @@ void loop() {
       }
     } else {
       pitchDeg = 0.0f; rollDeg = 0.0f;
-      rollServoCmd = 90; pitchServoCmd = 90;
+      rollServoCmd = SERVO_CENTER;
+      pitchServoCmd = SERVO_CENTER;
     }
   }
 
-  // ---------- Telemetry (optional / less noisy) ----------
+  // ---- Optional telemetry (quiet by default) ----
   if (telemetryOn && deviceConnected && (now - lastTelem >= telemetryIntervalMs)) {
     lastTelem = now;
     char buf[220];
     snprintf(buf, sizeof(buf),
-             "DATA t=%lu imu=%d cal=%d armed=%d pitch=%.1f roll=%.1f sRoll=%d sPitch=%d\n",
+             "DATA t=%lu armed=%d pitch=%.1f roll=%.1f sRoll=%d sPitch=%d\n",
              (unsigned long)now,
-             imuOk ? 1 : 0,
-             calibrated ? 1 : 0,
              armed ? 1 : 0,
              pitchDeg, rollDeg,
              rollServoCmd, pitchServoCmd);
