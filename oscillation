@@ -1,0 +1,255 @@
+#include <ESP32Servo.h>
+#include <NimBLEDevice.h>
+
+// Servo pins
+const int ROLL_PIN = 6;
+const int PITCH_PIN = 7;
+
+// Defaults
+int rollAngle = 93;
+int pitchAngle = 93;
+
+// Limits
+const int ROLL_MIN  = 45;
+const int ROLL_MAX  = 135;
+const int PITCH_MIN = 45;
+const int PITCH_MAX = 145;
+
+Servo rollServo;
+Servo pitchServo;
+
+// BLE NUS UUIDs
+static NimBLEUUID NUS_SERVICE("6E400001-B5A3-F393-E0A9-E50E24DCCA9E");
+static NimBLEUUID NUS_RX_CHAR("6E400002-B5A3-F393-E0A9-E50E24DCCA9E"); // phone writes
+static NimBLEUUID NUS_TX_CHAR("6E400003-B5A3-F393-E0A9-E50E24DCCA9E"); // notify to phone
+
+NimBLECharacteristic* txChar = nullptr;
+volatile bool deviceConnected = false;
+
+// Sweep state
+enum SweepMode { SWEEP_OFF, SWEEP_R, SWEEP_P, SWEEP_RP };
+SweepMode sweepMode = SWEEP_OFF;
+
+int sweepStepDeg = 2;            // degrees per step
+uint32_t sweepStepMs = 20;       // ms per step
+uint32_t lastSweepMs = 0;
+
+int rollDir = +1;
+int pitchDir = +1;
+
+static void sendLine(const char* s) {
+  if (deviceConnected && txChar) {
+    txChar->setValue((uint8_t*)s, strlen(s));
+    txChar->notify();
+  }
+}
+
+static void sendResp(const char* msg) {
+  char buf[200];
+  snprintf(buf, sizeof(buf), "RESP %s\n", msg);
+  sendLine(buf);
+}
+
+static void report() {
+  char buf[240];
+  snprintf(buf, sizeof(buf),
+           "RESP roll=%d pitch=%d (R %d..%d, P %d..%d) sweep=%d step=%d speedMs=%lu\n",
+           rollAngle, pitchAngle, ROLL_MIN, ROLL_MAX, PITCH_MIN, PITCH_MAX,
+           (int)sweepMode, sweepStepDeg, (unsigned long)sweepStepMs);
+  sendLine(buf);
+}
+
+static void apply() {
+  rollAngle  = constrain(rollAngle,  ROLL_MIN,  ROLL_MAX);
+  pitchAngle = constrain(pitchAngle, PITCH_MIN, PITCH_MAX);
+  rollServo.write(rollAngle);
+  pitchServo.write(pitchAngle);
+}
+
+static void setSweep(SweepMode m) {
+  sweepMode = m;
+  lastSweepMs = millis();
+  rollDir = +1;
+  pitchDir = +1;
+}
+
+class ServerCallbacks : public NimBLEServerCallbacks {
+public:
+  void onConnect(NimBLEServer*, NimBLEConnInfo&) {
+    deviceConnected = true;
+    sendResp("OK CONNECTED");
+    sendResp("Commands: R <45-135> | P <45-145> | RP <r> <p> | S");
+    sendResp("Sweep: SWEEP R | SWEEP P | SWEEP RP | STOP | STEP <deg> | SPEED <ms>");
+    apply();
+    report();
+  }
+
+  void onDisconnect(NimBLEServer*, NimBLEConnInfo&, int) {
+    deviceConnected = false;
+    NimBLEDevice::startAdvertising();
+  }
+
+  // Older signature compatibility
+  void onConnect(NimBLEServer*) {
+    deviceConnected = true;
+    sendResp("OK CONNECTED");
+    sendResp("Commands: R <45-135> | P <45-145> | RP <r> <p> | S");
+    sendResp("Sweep: SWEEP R | SWEEP P | SWEEP RP | STOP | STEP <deg> | SPEED <ms>");
+    apply();
+    report();
+  }
+
+  void onDisconnect(NimBLEServer*) {
+    deviceConnected = false;
+    NimBLEDevice::startAdvertising();
+  }
+};
+
+class RxCallbacks : public NimBLECharacteristicCallbacks {
+public:
+  void onWrite(NimBLECharacteristic* c, NimBLEConnInfo&) { handleRx(c); }
+  void onWrite(NimBLECharacteristic* c) { handleRx(c); }
+
+private:
+  void handleRx(NimBLECharacteristic* c) {
+    std::string v = c->getValue();
+    if (v.empty()) return;
+    if (v.size() > 50) { sendResp("ERR cmd too long"); return; }
+
+    for (char ch : v) {
+      if (ch < 0x20 || ch > 0x7E) { sendResp("ERR bad chars"); return; }
+    }
+    while (!v.empty() && (v.back() == '\r' || v.back() == '\n')) v.pop_back();
+
+    // Normalize (uppercase)
+    for (auto& ch : v) ch = (char)toupper(ch);
+
+    int r, p;
+
+    if (v == "S") { report(); return; }
+
+    if (v == "STOP") {
+      setSweep(SWEEP_OFF);
+      sendResp("OK STOP");
+      report();
+      return;
+    }
+
+    if (v == "SWEEP R") {
+      setSweep(SWEEP_R);
+      sendResp("OK SWEEP R");
+      return;
+    }
+    if (v == "SWEEP P") {
+      setSweep(SWEEP_P);
+      sendResp("OK SWEEP P");
+      return;
+    }
+    if (v == "SWEEP RP") {
+      setSweep(SWEEP_RP);
+      sendResp("OK SWEEP RP");
+      return;
+    }
+
+    int step;
+    if (sscanf(v.c_str(), "STEP %d", &step) == 1) {
+      if (step < 1 || step > 20) { sendResp("ERR STEP 1..20"); return; }
+      sweepStepDeg = step;
+      sendResp("OK STEP");
+      report();
+      return;
+    }
+
+    int spd;
+    if (sscanf(v.c_str(), "SPEED %d", &spd) == 1) {
+      if (spd < 5 || spd > 500) { sendResp("ERR SPEED 5..500"); return; }
+      sweepStepMs = (uint32_t)spd;
+      sendResp("OK SPEED");
+      report();
+      return;
+    }
+
+    if (sscanf(v.c_str(), "R %d", &r) == 1) {
+      setSweep(SWEEP_OFF); // manual command cancels sweep
+      rollAngle = r;
+      apply();
+      report();
+      return;
+    }
+
+    if (sscanf(v.c_str(), "P %d", &p) == 1) {
+      setSweep(SWEEP_OFF);
+      pitchAngle = p;
+      apply();
+      report();
+      return;
+    }
+
+    if (sscanf(v.c_str(), "RP %d %d", &r, &p) == 2) {
+      setSweep(SWEEP_OFF);
+      rollAngle = r;
+      pitchAngle = p;
+      apply();
+      report();
+      return;
+    }
+
+    sendResp("ERR unknown cmd");
+  }
+};
+
+void setup() {
+  rollServo.setPeriodHertz(50);
+  pitchServo.setPeriodHertz(50);
+  rollServo.attach(ROLL_PIN, 500, 2400);
+  pitchServo.attach(PITCH_PIN, 500, 2400);
+  apply();
+
+  NimBLEDevice::init("NANO-ESP32-MANUAL");
+
+  NimBLEServer* server = NimBLEDevice::createServer();
+  server->setCallbacks(new ServerCallbacks());
+
+  NimBLEService* svc = server->createService(NUS_SERVICE);
+  txChar = svc->createCharacteristic(NUS_TX_CHAR, NIMBLE_PROPERTY::NOTIFY);
+
+  NimBLECharacteristic* rxChar = svc->createCharacteristic(
+    NUS_RX_CHAR,
+    NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_NR
+  );
+  rxChar->setCallbacks(new RxCallbacks());
+
+  svc->start();
+
+  NimBLEAdvertising* adv = NimBLEDevice::getAdvertising();
+  adv->addServiceUUID(NUS_SERVICE);
+  adv->start();
+}
+
+void loop() {
+  if (sweepMode == SWEEP_OFF) {
+    delay(10);
+    return;
+  }
+
+  uint32_t now = millis();
+  if (now - lastSweepMs < sweepStepMs) {
+    delay(2);
+    return;
+  }
+  lastSweepMs = now;
+
+  if (sweepMode == SWEEP_R || sweepMode == SWEEP_RP) {
+    rollAngle += rollDir * sweepStepDeg;
+    if (rollAngle >= ROLL_MAX) { rollAngle = ROLL_MAX; rollDir = -1; }
+    if (rollAngle <= ROLL_MIN) { rollAngle = ROLL_MIN; rollDir = +1; }
+  }
+
+  if (sweepMode == SWEEP_P || sweepMode == SWEEP_RP) {
+    pitchAngle += pitchDir * sweepStepDeg;
+    if (pitchAngle >= PITCH_MAX) { pitchAngle = PITCH_MAX; pitchDir = -1; }
+    if (pitchAngle <= PITCH_MIN) { pitchAngle = PITCH_MIN; pitchDir = +1; }
+  }
+
+  apply();
+}
